@@ -93,11 +93,12 @@ func (is Server) WaitForApplication(
 			// replica on every turn of the loop.
 			repl, err := s.GetReplica(req.RangeID)
 			if err != nil {
-				return err
+				continue
 			}
 			repl.mu.RLock()
 			leaseAppliedIndex := repl.mu.state.LeaseAppliedIndex
 			repl.mu.RUnlock()
+			log.Infof(ctx, "lease applied index %d", leaseAppliedIndex)
 			if leaseAppliedIndex >= req.LeaseIndex {
 				return nil
 			}

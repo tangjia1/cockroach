@@ -22,11 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
-
-	"github.com/pkg/errors"
-	"go.etcd.io/etcd/raft/raftpb"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -38,10 +33,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/pkg/errors"
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 // evaluateCommand delegates to the eval method for the given
@@ -405,41 +403,17 @@ func (r *Replica) AdminMerge(
 		return reply, roachpb.NewError(err)
 	}
 
-	var origLeftDesc *roachpb.RangeDescriptor
-
-	retryOpts := base.DefaultRetryOptions()
-	retryOpts.MaxRetries = 10
-	var lastErr error
-retryLoop:
-	for retrier := retry.StartWithCtx(ctx, retryOpts); retrier.Next(); {
-		r.mu.RLock()
-		origLeftDesc = r.descRLocked()
-		raftStatus := r.raftStatusRLocked()
-		r.mu.RUnlock()
-		if raftStatus == nil {
-			// If we don't have any Raft status, we're probably not the leader. Return
-			// a NotLeaseHolderError. This isn't quite right--we could be a leader
-			// without being the leaseholder--but that situation resolves itself
-			// quickly.
-			lastErr = newNotLeaseHolderError(nil, r.store.StoreID(), origLeftDesc)
-			continue
-		}
-		for _, r := range origLeftDesc.Replicas {
-			if raftStatus.Progress[uint64(r.ReplicaID)].Match == 0 {
-				lastErr = fmt.Errorf("replica %d is uninitialized; try again later", r.ReplicaID)
-				continue retryLoop
-			}
-		}
-		lastErr = nil
-		break
-	}
-	if lastErr != nil {
-		return reply, roachpb.NewError(lastErr)
-	}
-
+	origLeftDesc := r.Desc()
 	if origLeftDesc.EndKey.Equal(roachpb.RKeyMax) {
 		// Merging the final range doesn't make sense.
 		return reply, roachpb.NewErrorf("cannot merge final range")
+	}
+
+	// LeaseAppliedIndex 1 is a dummy value. We don't care how up-to-date the
+	// LHS replicas are, only that they've applied at least one entry and are
+	// therefore initialized.
+	if err := waitForApplication(ctx, r.store.cfg.NodeDialer, *origLeftDesc, 0); err != nil {
+		return reply, roachpb.NewError(err)
 	}
 
 	updatedLeftDesc := *origLeftDesc
