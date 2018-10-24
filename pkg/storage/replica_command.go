@@ -405,7 +405,38 @@ func (r *Replica) AdminMerge(
 		return reply, roachpb.NewError(err)
 	}
 
-	origLeftDesc := r.Desc()
+	var origLeftDesc *roachpb.RangeDescriptor
+
+	retryOpts := base.DefaultRetryOptions()
+	retryOpts.MaxRetries = 10
+	var lastErr error
+retryLoop:
+	for retrier := retry.StartWithCtx(ctx, retryOpts); retrier.Next(); {
+		r.mu.RLock()
+		origLeftDesc = r.descRLocked()
+		raftStatus := r.raftStatusRLocked()
+		r.mu.RUnlock()
+		if raftStatus == nil {
+			// If we don't have any Raft status, we're probably not the leader. Return
+			// a NotLeaseHolderError. This isn't quite right--we could be a leader
+			// without being the leaseholder--but that situation resolves itself
+			// quickly.
+			lastErr = newNotLeaseHolderError(nil, r.store.StoreID(), origLeftDesc)
+			continue
+		}
+		for _, r := range origLeftDesc.Replicas {
+			if raftStatus.Progress[uint64(r.ReplicaID)].Match == 0 {
+				lastErr = fmt.Errorf("replica %d is uninitialized; try again later", r.ReplicaID)
+				continue retryLoop
+			}
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return reply, roachpb.NewError(lastErr)
+	}
+
 	if origLeftDesc.EndKey.Equal(roachpb.RKeyMax) {
 		// Merging the final range doesn't make sense.
 		return reply, roachpb.NewErrorf("cannot merge final range")
